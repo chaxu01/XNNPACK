@@ -631,14 +631,7 @@ XNN_NO_SANITIZE_FUNCTION void xnn_compute_f32_hybrid_gemm(
     size_t mr_block_size) {
   assert(context->a_unpacked != NULL);
   assert(context->f32_hybrid_neon_ukernel != NULL);
-  assert(context->f32_hybrid_sme_threads != 0);
   const bool use_sme2 = thread_id < context->f32_hybrid_sme_threads;
-  xnn_log_debug(
-      "F32 hybrid GEMM worker %zu running %s: m=%zu+%zu, n=%zu+%zu, "
-      "output elements=%zu",
-      (size_t)thread_id, use_sme2 ? "SME2" : "NEON", mr_block_start,
-      mr_block_size, nr_block_start, nr_block_size,
-      mr_block_size * nr_block_size);
 
   if (use_sme2) {
     compute_hmp_qp8gemm(context, XNN_UARCH_DEFAULT, nr_block_start,
@@ -658,6 +651,39 @@ XNN_NO_SANITIZE_FUNCTION void xnn_compute_f32_hybrid_gemm(
       context->cm_stride, sizeof(float),
       (const struct xnn_f32_minmax_params*)context->fused_params);
 }
+
+#if XNN_COMPILER_CLANG || XNN_COMPILER_GCC
+void xnn_compute_f32_hybrid_queue(struct gemm_context* context,
+                                  size_t thread_id, size_t task_index) {
+  (void)task_index;
+  const size_t claim = thread_id < context->f32_hybrid_sme_threads
+                           ? context->f32_hybrid_sme_claim
+                           : context->f32_hybrid_neon_claim;
+  size_t first = __atomic_fetch_add(&context->f32_hybrid_next_tile, claim,
+                                    __ATOMIC_RELAXED);
+  while (first < context->f32_hybrid_num_tiles) {
+    size_t count = min(claim, context->f32_hybrid_num_tiles - first);
+    while (count != 0) {
+      const size_t n_tile = first / context->f32_hybrid_tiles_m;
+      const size_t m_tile = first % context->f32_hybrid_tiles_m;
+      const size_t rows = min(count, context->f32_hybrid_tiles_m - m_tile);
+      const size_t n_start = n_tile * context->f32_hybrid_tile_n;
+      const size_t m_start = m_tile * context->f32_hybrid_tile_m;
+      const size_t m_end = m_tile + rows == context->f32_hybrid_tiles_m
+                               ? context->f32_hybrid_m
+                               : (m_tile + rows) * context->f32_hybrid_tile_m;
+      xnn_compute_f32_hybrid_gemm(
+          context, (uint32_t)thread_id, n_start, m_start,
+          min(context->f32_hybrid_tile_n, context->f32_hybrid_n - n_start),
+          m_end - m_start);
+      first += rows;
+      count -= rows;
+    }
+    first = __atomic_fetch_add(&context->f32_hybrid_next_tile, claim,
+                               __ATOMIC_RELAXED);
+  }
+}
+#endif
 
 XNN_NO_SANITIZE_FUNCTION void xnn_compute_spmm(
     struct spmm_context* restrict context, size_t batch_index,
@@ -2121,6 +2147,16 @@ enum xnn_status xnn_run_operator_with_index(xnn_operator_t op,
             threadpool, compute->task_1d_with_thread, context,
             compute->range[0], flags);
         break;
+#if XNN_COMPILER_CLANG || XNN_COMPILER_GCC
+      case xnn_parallelization_type_f32_hybrid_queue:
+        assert(compute->range[0] != 0);
+        __atomic_store_n(&((struct gemm_context*)context)->f32_hybrid_next_tile,
+                         0, __ATOMIC_RELAXED);
+        pthreadpool_parallelize_1d_with_thread(
+            threadpool, compute->task_1d_with_thread, context,
+            compute->range[0], flags);
+        break;
+#endif
       case xnn_parallelization_type_1d_tile_1d:
         assert(compute->range[0] != 0);
         assert(compute->tile[0] != 0);

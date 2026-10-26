@@ -9,14 +9,20 @@
 // LICENSE file in the root directory of this source tree.
 
 #include <assert.h>
+#include <ctype.h>
 #include <float.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <math.h>
+#include <pthreadpool.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 
 #include "include/experimental.h"
 #include "include/xnnpack.h"
@@ -43,26 +49,94 @@
 #include "src/xnnpack/pack-lh.h"
 #include "src/xnnpack/pack.h"
 #include "src/xnnpack/params.h"
-#include <pthreadpool.h>
 
-#if XNN_ARCH_ARM64 && XNN_ENABLE_KLEIDIAI && XNN_ENABLE_ARM_SME2
-static bool xnn_f32_hybrid_runtime_enabled(void) {
-  const char* value = getenv("XNN_ENABLE_F32_HYBRID");
-  return value != NULL && strcmp(value, "1") == 0;
+#if XNN_ARCH_ARM64 && XNN_ENABLE_KLEIDIAI && XNN_ENABLE_ARM_SME2 && \
+    (XNN_COMPILER_CLANG || XNN_COMPILER_GCC)
+// Return the number of independent SME compute units when the platform exposes
+// it. On Apple silicon, performance-core L2 clusters share those units.
+static size_t xnn_f32_detect_sme_threads(void) {
+#if defined(__APPLE__)
+  int perf_levels = 0;
+  size_t size = sizeof(perf_levels);
+  if (sysctlbyname("hw.nperflevels", &perf_levels, &size, NULL, 0) == 0 &&
+      size == sizeof(perf_levels) && perf_levels > 0) {
+    size_t units = 0;
+    for (int i = 0; i < perf_levels; i++) {
+      char key[64];
+      char name[64];
+      int physical_cpus = 0;
+      int cpus_per_l2 = 0;
+      snprintf(key, sizeof(key), "hw.perflevel%d.physicalcpu", i);
+      size = sizeof(physical_cpus);
+      if (sysctlbyname(key, &physical_cpus, &size, NULL, 0) != 0 ||
+          size != sizeof(physical_cpus) || physical_cpus <= 0) {
+        continue;
+      }
+      snprintf(key, sizeof(key), "hw.perflevel%d.cpusperl2", i);
+      size = sizeof(cpus_per_l2);
+      if (sysctlbyname(key, &cpus_per_l2, &size, NULL, 0) != 0 ||
+          size != sizeof(cpus_per_l2) || cpus_per_l2 <= 0) {
+        continue;
+      }
+      snprintf(key, sizeof(key), "hw.perflevel%d.name", i);
+      size = sizeof(name);
+      if (sysctlbyname(key, name, &size, NULL, 0) != 0 || size == 0) {
+        continue;
+      }
+      name[min(size, sizeof(name) - 1)] = '\0';
+      for (size_t j = 0; j < sizeof(name) && name[j] != '\0'; j++) {
+        name[j] = (char)tolower((unsigned char)name[j]);
+      }
+      if (strstr(name, "performance") != NULL ||
+          strstr(name, "super") != NULL) {
+        units += divide_round_up((size_t)physical_cpus, (size_t)cpus_per_l2);
+      }
+    }
+    if (units != 0) {
+      return units;
+    }
+  }
+#endif
+  // The platform does not expose a calibrated SME compute-unit count.
+  return 1;
 }
 
-static size_t xnn_f32_hybrid_sme_threads(size_t num_threads) {
-  const char* value = getenv("XNN_F32_HYBRID_SME_THREADS");
+// An explicit zero selects NEON only; positive values override the detected
+// SME worker count when hybrid execution is enabled.
+static size_t xnn_f32_sme_threads(size_t num_threads) {
+  const char* value = getenv("XNN_F32_SME");
+  const size_t detected = min(xnn_f32_detect_sme_threads(), num_threads);
   if (value == NULL) {
-    return 1;
+    return detected;
   }
 
   char* end = NULL;
   const unsigned long parsed = strtoul(value, &end, 10);
-  if (end == value || *end != '\0' || parsed == 0) {
-    return 1;
+  if (end == value || *end != '\0' || value[0] == '-') {
+    xnn_log_warning("invalid XNN_F32_SME value: %s", value);
+    return detected;
   }
   return min((size_t)parsed, num_threads);
+}
+
+static bool xnn_f32_hybrid_enabled(void) {
+  const char* value = getenv("XNN_ENABLE_F32_HYBRID");
+  return value != NULL && strcmp(value, "1") == 0;
+}
+
+static size_t xnn_f32_hybrid_chunk_tiles(const char* name, size_t fallback) {
+  const char* value = getenv(name);
+  if (value == NULL) {
+    return fallback;
+  }
+  char* end = NULL;
+  const unsigned long parsed = strtoul(value, &end, 10);
+  if (end == value || *end != '\0' || value[0] == '-' || parsed == 0 ||
+      parsed > INT_MAX) {
+    xnn_log_warning("invalid %s value: %s", name, value);
+    return fallback;
+  }
+  return (size_t)parsed;
 }
 #endif
 
@@ -3471,19 +3545,33 @@ reshape_fully_connected_nc_with_pack_lh_config(
 
   bool f32_hybrid = false;
   size_t f32_hybrid_sme_threads = 0;
-  size_t f32_hybrid_n_step = 0;
   xnn_f32_gemm_minmax_ukernel_fn f32_hybrid_neon_ukernel = NULL;
-#if XNN_ARCH_ARM64 && XNN_ENABLE_KLEIDIAI && XNN_ENABLE_ARM_SME2
+#if XNN_ARCH_ARM64 && XNN_ENABLE_KLEIDIAI && XNN_ENABLE_ARM_SME2 && \
+    (XNN_COMPILER_CLANG || XNN_COMPILER_GCC)
+  size_t f32_hybrid_n_step = 0;
   if (fully_connected_op->type == xnn_operator_type_fully_connected_nc_pf32 &&
       fully_connected_op->gemm_config->arch == xnn_arch_arm_sme2 &&
-      inline_lhs_packing && batch_size >= 128 && num_threads > 1 &&
-      xnn_f32_hybrid_runtime_enabled()) {
+      inline_lhs_packing) {
+    f32_hybrid_sme_threads = xnn_f32_sme_threads(num_threads);
+    // Zero always selects NEON. Otherwise, use every worker for SME unless
+    // hybrid execution was explicitly enabled.
+    if (f32_hybrid_sme_threads != 0 && !xnn_f32_hybrid_enabled()) {
+      f32_hybrid_sme_threads = num_threads;
+    }
+  }
+  if (fully_connected_op->type == xnn_operator_type_fully_connected_nc_pf32 &&
+      fully_connected_op->gemm_config->arch == xnn_arch_arm_sme2 &&
+      inline_lhs_packing &&
+      f32_hybrid_sme_threads < num_threads) {
     f32_hybrid_n_step =
         xnn_pf32_gemm_minmax_ukernel_32x32__neonsme2_get_hybrid_n_step(
             input_channels);
     if (f32_hybrid_n_step != 0) {
-      f32_hybrid_sme_threads = xnn_f32_hybrid_sme_threads(num_threads);
-      if (f32_hybrid_sme_threads < num_threads) {
+      const size_t tiles_m = divide_round_up(batch_size, mr);
+      const size_t tiles_n =
+          divide_round_up(output_channels, f32_hybrid_n_step);
+      size_t num_tiles = 0;
+      if (xnn_safe_mul(tiles_m, tiles_n, &num_tiles) && num_tiles != 0) {
         f32_hybrid = true;
         f32_hybrid_neon_ukernel = xnn_f32_gemm_minmax_ukernel_6x16__kai_neon;
         xnn_log_debug(
@@ -3492,6 +3580,10 @@ reshape_fully_connected_nc_with_pack_lh_config(
             f32_hybrid_sme_threads, num_threads - f32_hybrid_sme_threads);
       }
     }
+  }
+  if (f32_hybrid && f32_hybrid_sme_threads == 0) {
+    // NEON reads the original LHS, so no SME LHS pack or workspace is needed.
+    packed_lh_config = NULL;
   }
 #endif
 
@@ -3515,19 +3607,13 @@ reshape_fully_connected_nc_with_pack_lh_config(
         xnn_operator_type_to_string_v2(fully_connected_op));
     return xnn_status_out_of_memory;
   }
-  size_t nc = xnn_gemm_best_tile_size(
+  const size_t nc = xnn_gemm_best_tile_size(
       /*num_groups=*/1, /*m=*/batch_size, /*n=*/output_channels,
       /*m_stride=*/m_stride,
       /*n_stride=*/
       fully_connected_op->weights_stride,
       /*cn_stride=*/1 << log2_output_element_size, mr, nr,
       /*num_threads=*/num_threads);
-  if (f32_hybrid) {
-    // Extra chunks let faster workers claim more work from the dynamic queue.
-    const size_t target_chunks = num_threads * 4;
-    nc = round_up(divide_round_up(output_channels, target_chunks),
-                  f32_hybrid_n_step);
-  }
 
   // If we are packing the LHS, provide a per-thread workspace to do so inline.
   if (packed_lh_config) {
@@ -3558,14 +3644,15 @@ reshape_fully_connected_nc_with_pack_lh_config(
             "it is a no-op for GEMV.",
             xnn_operator_type_to_string(fully_connected_op->type), batch_size,
             output_channels, input_channels);
-      } else if (f32_hybrid || !should_inline_lhs_packing ||
+      } else if ((f32_hybrid && f32_hybrid_sme_threads != 0) ||
+                 !should_inline_lhs_packing ||
                  num_threads * mr > round_up(batch_size, mr)) {
         xnn_log_debug(
             "Pre-packing LHS of %s with m=%zu, n=%zu, and k=%zu despite "
             "request to inline because %s.",
             xnn_operator_type_to_string(fully_connected_op->type), batch_size,
             output_channels, input_channels,
-            f32_hybrid ? "hybrid GEMM requires a shared packed lhs"
+            f32_hybrid ? "SME GEMM requires a shared packed lhs"
             : !should_inline_lhs_packing
                 ? "packed lhs will likely not stay in cache"
                 : "batch size does not parallelize well over the number "
@@ -3605,7 +3692,7 @@ reshape_fully_connected_nc_with_pack_lh_config(
         fully_connected_op->compute[0].range[0] = 1;
         fully_connected_op->compute[0].range[1] = batch_size;
         fully_connected_op->compute[0].tile[0] =
-            f32_hybrid
+            f32_hybrid && f32_hybrid_sme_threads != 0
                 ? round_up(divide_round_up(batch_size, f32_hybrid_sme_threads),
                            mr_packed)
                 : mr_packed;
@@ -3718,77 +3805,98 @@ reshape_fully_connected_nc_with_pack_lh_config(
   memcpy(&gemm_context->gemm.params, params, params_size);
   gemm_context->gemm.fused_params = &gemm_context->gemm.params;
 
+#if XNN_ARCH_ARM64 && XNN_ENABLE_KLEIDIAI && XNN_ENABLE_ARM_SME2 && \
+    (XNN_COMPILER_CLANG || XNN_COMPILER_GCC)
   if (f32_hybrid) {
-    gemm_compute->type =
-        xnn_parallelization_type_2d_tile_2d_dynamic_with_thread;
-    gemm_compute->task_2d_tile_2d_dynamic_with_id =
-        (pthreadpool_task_2d_tile_2d_dynamic_with_id_t)
-            xnn_compute_f32_hybrid_gemm;
-  } else {
+    struct gemm_context* hybrid = &gemm_context->gemm;
+    hybrid->f32_hybrid_m = batch_size;
+    hybrid->f32_hybrid_n = output_channels;
+    hybrid->f32_hybrid_tile_m = mr;
+    hybrid->f32_hybrid_tile_n = f32_hybrid_n_step;
+    hybrid->f32_hybrid_tiles_m = divide_round_up(batch_size, mr);
+    hybrid->f32_hybrid_num_tiles =
+        hybrid->f32_hybrid_tiles_m *
+        divide_round_up(output_channels, f32_hybrid_n_step);
+    hybrid->f32_hybrid_sme_claim =
+        min(xnn_f32_hybrid_chunk_tiles("XNN_F32_HYBRID_SME_CHUNK_TILES", 4),
+            hybrid->f32_hybrid_num_tiles);
+    hybrid->f32_hybrid_neon_claim =
+        min(xnn_f32_hybrid_chunk_tiles("XNN_F32_HYBRID_NEON_CHUNK_TILES", 1),
+            hybrid->f32_hybrid_num_tiles);
+    gemm_compute->type = xnn_parallelization_type_f32_hybrid_queue;
+    gemm_compute->task_1d_with_thread =
+        (pthreadpool_task_1d_with_thread_t)xnn_compute_f32_hybrid_queue;
+    gemm_compute->range[0] = num_threads;
+  } else
+#endif
+  {
 #if XNN_MAX_UARCH_TYPES > 1
-  if (xnn_is_hmp_gemm_ukernel(gemm_ukernel)) {
-    if (packed_lh_config) {
-      if (inline_lhs_packing) {
-        gemm_compute->type =
-            xnn_parallelization_type_1d_tile_1d_dynamic_with_uarch_with_thread;
-        fully_connected_op->compute[0]
-            .task_1d_tile_1d_dynamic_with_id_with_thread =
-            (pthreadpool_task_1d_tile_1d_dynamic_with_id_with_thread_t)
-                xnn_compute_hmp_inline_packed_qp8gemm;
+    if (xnn_is_hmp_gemm_ukernel(gemm_ukernel)) {
+      if (packed_lh_config) {
+        if (inline_lhs_packing) {
+          gemm_compute->type =
+              xnn_parallelization_type_1d_tile_1d_dynamic_with_uarch_with_thread;
+          fully_connected_op->compute[0]
+              .task_1d_tile_1d_dynamic_with_id_with_thread =
+              (pthreadpool_task_1d_tile_1d_dynamic_with_id_with_thread_t)
+                  xnn_compute_hmp_inline_packed_qp8gemm;
+        } else {
+          gemm_compute->type =
+              xnn_parallelization_type_2d_tile_2d_dynamic_with_uarch;
+          gemm_compute->task_2d_tile_2d_dynamic_with_id =
+              (pthreadpool_task_2d_tile_2d_dynamic_with_id_t)
+                  xnn_compute_hmp_qp8gemm;
+        }
       } else {
         gemm_compute->type =
             xnn_parallelization_type_2d_tile_2d_dynamic_with_uarch;
-        gemm_compute->task_2d_tile_2d_dynamic_with_id =
-            (pthreadpool_task_2d_tile_2d_dynamic_with_id_t)
-                xnn_compute_hmp_qp8gemm;
+        if (dynamic_quantization) {
+          gemm_compute->task_2d_tile_2d_dynamic_with_id =
+              (pthreadpool_task_2d_tile_2d_dynamic_with_id_t)
+                  xnn_compute_hmp_dqgemm;
+        } else {
+          gemm_compute->task_2d_tile_2d_dynamic_with_id =
+              (pthreadpool_task_2d_tile_2d_dynamic_with_id_t)
+                  xnn_compute_hmp_gemm;
+        }
       }
-    } else {
-      gemm_compute->type =
-          xnn_parallelization_type_2d_tile_2d_dynamic_with_uarch;
-      if (dynamic_quantization) {
-        gemm_compute->task_2d_tile_2d_dynamic_with_id =
-            (pthreadpool_task_2d_tile_2d_dynamic_with_id_t)
-                xnn_compute_hmp_dqgemm;
-      } else {
-        gemm_compute->task_2d_tile_2d_dynamic_with_id =
-            (pthreadpool_task_2d_tile_2d_dynamic_with_id_t)xnn_compute_hmp_gemm;
-      }
-    }
-  } else
+    } else
 #endif  // XNN_MAX_UARCH_TYPES > 1
-    if (packed_lh_config) {
-      if (inline_lhs_packing) {
-        gemm_compute->type =
-            xnn_parallelization_type_1d_tile_1d_dynamic_with_thread;
-        gemm_compute->task_1d_tile_1d_dynamic_with_id =
-            (pthreadpool_task_1d_tile_1d_dynamic_with_id_t)
-                xnn_compute_inline_packed_qp8gemm;
+      if (packed_lh_config) {
+        if (inline_lhs_packing) {
+          gemm_compute->type =
+              xnn_parallelization_type_1d_tile_1d_dynamic_with_thread;
+          gemm_compute->task_1d_tile_1d_dynamic_with_id =
+              (pthreadpool_task_1d_tile_1d_dynamic_with_id_t)
+                  xnn_compute_inline_packed_qp8gemm;
+        } else {
+          gemm_compute->type = xnn_parallelization_type_2d_tile_2d_dynamic;
+          gemm_compute->task_2d_tile_2d_dynamic =
+              (pthreadpool_task_2d_tile_2d_dynamic_t)xnn_compute_qp8gemm;
+        }
       } else {
         gemm_compute->type = xnn_parallelization_type_2d_tile_2d_dynamic;
-        gemm_compute->task_2d_tile_2d_dynamic =
-            (pthreadpool_task_2d_tile_2d_dynamic_t)xnn_compute_qp8gemm;
+        if (dynamic_quantization) {
+          gemm_compute->task_2d_tile_2d_dynamic =
+              (pthreadpool_task_2d_tile_2d_dynamic_t)xnn_compute_dqgemm;
+        } else {
+          gemm_compute->type = xnn_parallelization_type_2d_tile_2d_dynamic;
+          gemm_compute->task_2d_tile_2d_dynamic =
+              (pthreadpool_task_2d_tile_2d_dynamic_t)xnn_compute_gemm;
+        }
       }
-    } else {
-      gemm_compute->type = xnn_parallelization_type_2d_tile_2d_dynamic;
-      if (dynamic_quantization) {
-        gemm_compute->task_2d_tile_2d_dynamic =
-            (pthreadpool_task_2d_tile_2d_dynamic_t)xnn_compute_dqgemm;
-      } else {
-        gemm_compute->type = xnn_parallelization_type_2d_tile_2d_dynamic;
-        gemm_compute->task_2d_tile_2d_dynamic =
-            (pthreadpool_task_2d_tile_2d_dynamic_t)xnn_compute_gemm;
-      }
-    }
   }
 
-  if (packed_lh_config && inline_lhs_packing) {
-    gemm_compute->range[0] = batch_size;
-    gemm_compute->tile[0] = mr;
-  } else {
-    gemm_compute->range[0] = output_channels;
-    gemm_compute->range[1] = batch_size;
-    gemm_compute->tile[0] = nc;
-    gemm_compute->tile[1] = mr;
+  if (!f32_hybrid) {
+    if (packed_lh_config && inline_lhs_packing) {
+      gemm_compute->range[0] = batch_size;
+      gemm_compute->tile[0] = mr;
+    } else {
+      gemm_compute->range[0] = output_channels;
+      gemm_compute->range[1] = batch_size;
+      gemm_compute->tile[0] = nc;
+      gemm_compute->tile[1] = mr;
+    }
   }
   fully_connected_op->state = xnn_run_state_needs_setup;
 

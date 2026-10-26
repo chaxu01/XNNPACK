@@ -22,6 +22,9 @@ enum xnn_parallelization_type {
   xnn_parallelization_type_invalid = 0,
   xnn_parallelization_type_1d,
   xnn_parallelization_type_1d_with_thread,
+#if XNN_COMPILER_CLANG || XNN_COMPILER_GCC
+  xnn_parallelization_type_f32_hybrid_queue,
+#endif
   xnn_parallelization_type_1d_tile_1d,
   xnn_parallelization_type_1d_tile_1d_dynamic,
   xnn_parallelization_type_1d_tile_1d_dynamic_with_thread,
@@ -372,6 +375,15 @@ struct gemm_context {
   };
   xnn_f32_gemm_minmax_ukernel_fn f32_hybrid_neon_ukernel;
   size_t f32_hybrid_sme_threads;
+  size_t f32_hybrid_m;
+  size_t f32_hybrid_n;
+  size_t f32_hybrid_tile_m;
+  size_t f32_hybrid_tile_n;
+  size_t f32_hybrid_tiles_m;
+  size_t f32_hybrid_num_tiles;
+  size_t f32_hybrid_sme_claim;
+  size_t f32_hybrid_neon_claim;
+  size_t f32_hybrid_next_tile;
   // Parameters for dynamically quantized inputs.
   const struct xnn_qd8_quantization_params* quantization_params;
   const float* row_sum;
@@ -445,6 +457,11 @@ XNN_PRIVATE void xnn_compute_hmp_gemm(
 XNN_PRIVATE void xnn_compute_f32_hybrid_gemm(
     struct gemm_context* context, uint32_t thread_id, size_t nr_block_start,
     size_t mr_block_start, size_t nr_block_size, size_t mr_block_size);
+
+#if XNN_COMPILER_CLANG || XNN_COMPILER_GCC
+XNN_PRIVATE void xnn_compute_f32_hybrid_queue(
+    struct gemm_context* context, size_t thread_id, size_t task_index);
+#endif
 
 XNN_PRIVATE void xnn_compute_hmp_dqgemm(
     struct gemm_context* context, uint32_t uarch_index, size_t nr_block_start,

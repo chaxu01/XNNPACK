@@ -41,6 +41,12 @@ size_t xnn_pf32_gemm_minmax_ukernel_32x32__neonsme2_get_nr() {
 #endif  // XNN_ENABLE_KLEIDIAI
 }
 
+#if defined(__clang__)
+// Apple exposes SME but not non-streaming SVE. This compatibility check runs
+// before the SME kernel starts streaming mode. Prevent the compiler from
+// vectorizing its offset comparisons into non-streaming SVE instructions.
+__attribute__((optnone))
+#endif
 size_t xnn_pf32_gemm_minmax_ukernel_32x32__neonsme2_get_hybrid_n_step(
     size_t k) {
 #if XNN_ENABLE_KLEIDIAI
@@ -48,13 +54,19 @@ size_t xnn_pf32_gemm_minmax_ukernel_32x32__neonsme2_get_hybrid_n_step(
   const struct kai_matmul_uker_config elastic_config = {0};
   const struct kai_matmul_pack_rhs_uker_api pack_api =
       kai_matmul_pack_rhs_nxk_x32p4vsx1bx32_x32_x32_sme();
+  const struct kai_matmul_pack_rhs_uker_api transpose_pack_api =
+      kai_matmul_pack_rhs_kxn_x32p4vsx1bx32_x32_x32_sme();
   const struct kai_matmul_uker_api elastic_api =
       kai_matmul_clamp_f32_f32p4vsx1_f32p4vsx1bf32_8vsx8vs_sme2_mopa();
   const size_t pack_n_step = pack_api.get_step(&pack_config).n;
   const size_t elastic_n_step = elastic_api.get_step(&elastic_config).n;
   const size_t neon_n_step =
       kai_get_n_step_matmul_clamp_f32_f32_f32p16x1b_6x16_neon_mla();
-  if (pack_n_step != neon_n_step || elastic_n_step % neon_n_step != 0) {
+  // The NEON kernel reads one 16-channel bias-and-weights block at a time.
+  // Other SME vector lengths need a different NEON kernel.
+  if (pack_n_step != 16 || pack_n_step != neon_n_step ||
+      elastic_n_step != pack_n_step ||
+      transpose_pack_api.get_step(&pack_config).n != pack_n_step) {
     return 0;
   }
 
@@ -64,13 +76,27 @@ size_t xnn_pf32_gemm_minmax_ukernel_32x32__neonsme2_get_hybrid_n_step(
   };
   const struct kai_matmul_pack_rhs_uker_rhs_packed_stride_args stride =
       pack_api.get_rhs_packed_stride(&pack_config, &shape);
+  const struct kai_matmul_pack_rhs_uker_rhs_packed_stride_args
+      transpose_stride =
+          transpose_pack_api.get_rhs_packed_stride(&pack_config, &shape);
+  const struct kai_matmul_uker_rhs_dim_args elastic_shape = {shape.n, k};
+  const struct kai_matmul_uker_rhs_stride_args elastic_stride =
+      elastic_api.get_rhs_stride(&elastic_config, &elastic_shape);
+  if (stride.n != (k + 1) * neon_n_step * sizeof(float) ||
+      transpose_stride.n != stride.n || elastic_stride.n != stride.n) {
+    return 0;
+  }
   for (size_t n = pack_n_step; n <= 2 * elastic_n_step; n += pack_n_step) {
     const struct kai_matmul_pack_rhs_uker_rhs_packed_dim_args index = {
         .n = n,
     };
-    if (pack_api.get_rhs_packed_offset(&pack_config, &index, &stride) !=
+    const size_t expected_offset =
         kai_get_rhs_packed_offset_matmul_clamp_f32_f32_f32p16x1b_6x16_neon_mla(
-            n, k)) {
+            n, k);
+    if (pack_api.get_rhs_packed_offset(&pack_config, &index, &stride) !=
+            expected_offset ||
+        transpose_pack_api.get_rhs_packed_offset(
+            &pack_config, &index, &transpose_stride) != expected_offset) {
       return 0;
     }
   }
