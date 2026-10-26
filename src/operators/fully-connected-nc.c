@@ -124,6 +124,18 @@ static bool xnn_f32_hybrid_enabled(void) {
   return value != NULL && strcmp(value, "1") == 0;
 }
 
+static bool xnn_f32_hybrid_queue_enabled(void) {
+  const char* value = getenv("XNNPACK_HYBRID_QUEUE");
+  if (value == NULL || strcmp(value, "1") == 0) {
+    return true;
+  }
+  if (strcmp(value, "0") == 0) {
+    return false;
+  }
+  xnn_log_warning("invalid XNNPACK_HYBRID_QUEUE value: %s", value);
+  return true;
+}
+
 static size_t xnn_f32_hybrid_chunk_tiles(const char* name, size_t fallback) {
   const char* value = getenv(name);
   if (value == NULL) {
@@ -3555,7 +3567,8 @@ reshape_fully_connected_nc_with_pack_lh_config(
     f32_hybrid_sme_threads = xnn_f32_sme_threads(num_threads);
     // Zero always selects NEON. Otherwise, use every worker for SME unless
     // hybrid execution was explicitly enabled.
-    if (f32_hybrid_sme_threads != 0 && !xnn_f32_hybrid_enabled()) {
+    if (f32_hybrid_sme_threads != 0 && !xnn_f32_hybrid_enabled() &&
+        (fully_connected_op->flags & XNN_FLAG_HYBRID_SME2_F32) == 0) {
       f32_hybrid_sme_threads = num_threads;
     }
   }
@@ -3823,10 +3836,22 @@ reshape_fully_connected_nc_with_pack_lh_config(
     hybrid->f32_hybrid_neon_claim =
         min(xnn_f32_hybrid_chunk_tiles("XNN_F32_HYBRID_NEON_CHUNK_TILES", 1),
             hybrid->f32_hybrid_num_tiles);
-    gemm_compute->type = xnn_parallelization_type_f32_hybrid_queue;
-    gemm_compute->task_1d_with_thread =
-        (pthreadpool_task_1d_with_thread_t)xnn_compute_f32_hybrid_queue;
-    gemm_compute->range[0] = num_threads;
+    if (xnn_f32_hybrid_queue_enabled()) {
+      gemm_compute->type = xnn_parallelization_type_f32_hybrid_queue;
+      gemm_compute->task_1d_with_thread =
+          (pthreadpool_task_1d_with_thread_t)xnn_compute_f32_hybrid_queue;
+      gemm_compute->range[0] = num_threads;
+    } else {
+      gemm_compute->type =
+          xnn_parallelization_type_2d_tile_2d_dynamic_with_thread;
+      gemm_compute->task_2d_tile_2d_dynamic_with_id =
+          (pthreadpool_task_2d_tile_2d_dynamic_with_id_t)
+              xnn_compute_f32_hybrid_gemm;
+      gemm_compute->range[0] = output_channels;
+      gemm_compute->range[1] = batch_size;
+      gemm_compute->tile[0] = f32_hybrid_n_step;
+      gemm_compute->tile[1] = mr;
+    }
   } else
 #endif
   {

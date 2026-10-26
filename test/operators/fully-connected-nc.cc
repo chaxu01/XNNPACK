@@ -1092,8 +1092,10 @@ class ScopedF32EnvVar {
 TEST(FULLY_CONNECTED_NC_PF32, hybrid_sme2_neon) {
   ScopedF32EnvVar sme("XNN_F32_SME");
   ScopedF32EnvVar hybrid("XNN_ENABLE_F32_HYBRID");
+  ScopedF32EnvVar queue("XNNPACK_HYBRID_QUEUE");
   sme.Set("2");
   hybrid.Set("1");
+  queue.Set("1");
 
   constexpr size_t batch_size = 131;
   constexpr size_t input_channels = 37;
@@ -1217,6 +1219,36 @@ TEST(FULLY_CONNECTED_NC_PF32, hybrid_sme2_neon) {
       }
     }
 
+    // The earlier dynamic scheduler must use the same packed RHS and outputs.
+    queue.Set("0");
+    size_t dynamic_workspace_size = 0;
+    ASSERT_EQ(xnn_status_success, xnn_reshape_fully_connected_nc_pf32(
+                                      fully_connected_op, batch_size,
+                                      &dynamic_workspace_size,
+                                      auto_threadpool.get()));
+    ASSERT_EQ(xnn_parallelization_type_2d_tile_2d_dynamic_with_thread,
+              fully_connected_op->compute[1].type);
+    xnnpack::Buffer<uint8_t, XNN_ALLOCATION_ALIGNMENT> dynamic_workspace(
+        dynamic_workspace_size);
+    ASSERT_EQ(xnn_status_success, xnn_setup_fully_connected_nc_pf32(
+                                      fully_connected_op, input.data(),
+                                      output.data(), dynamic_workspace.data()));
+    for (size_t run = 0; run < 2; run++) {
+      std::fill(output.begin(), output.end(),
+                std::numeric_limits<float>::quiet_NaN());
+      ASSERT_EQ(xnn_status_success,
+                xnn_run_operator(fully_connected_op, auto_threadpool.get()));
+      for (size_t m = 0; m < batch_size; m++) {
+        for (size_t n = 0; n < output_channels; n++) {
+          const float expected = output_ref[m * output_channels + n];
+          ASSERT_NEAR(expected, output[m * output_stride + n],
+                      std::max(1.0e-4f * std::abs(expected), 1.0e-4f))
+              << "at " << m << ", " << n;
+        }
+      }
+    }
+    queue.Set("1");
+
     // The same worker split must also handle a single output row (GEMV).
     size_t single_row_workspace_size = 0;
     ASSERT_EQ(xnn_status_success, xnn_reshape_fully_connected_nc_pf32(
@@ -1244,6 +1276,8 @@ TEST(FULLY_CONNECTED_NC_PF32, hybrid_sme2_neon) {
 TEST(FULLY_CONNECTED_NC_PF32, sme_worker_selection) {
   ScopedF32EnvVar sme("XNN_F32_SME");
   ScopedF32EnvVar hybrid("XNN_ENABLE_F32_HYBRID");
+  ScopedF32EnvVar queue("XNNPACK_HYBRID_QUEUE");
+  queue.Set("1");
   ASSERT_EQ(xnn_status_success, xnn_initialize(nullptr));
   constexpr size_t input_channels = 37;
   constexpr size_t output_channels = 257;
@@ -1299,11 +1333,37 @@ TEST(FULLY_CONNECTED_NC_PF32, sme_worker_selection) {
                 op->dynamic_context.gemm->gemm.f32_hybrid_sme_threads);
     }
   }
+
+  // A direct operator flag is an alternative to the environment opt-in.
+  sme.Set("2");
+  hybrid.Set("0");
+  xnn_operator_t flagged_op = nullptr;
+  ASSERT_EQ(xnn_status_success,
+            xnn_create_fully_connected_nc_pf32(
+                input_channels, output_channels, input_channels,
+                output_channels, weights.data(), nullptr, -1.0f, 1.0f,
+                XNN_FLAG_INLINE_LHS_PACKING | XNN_FLAG_HYBRID_SME2_F32,
+                nullptr, &flagged_op));
+  std::unique_ptr<xnn_operator, decltype(&xnn_delete_operator)> auto_flagged_op(
+      flagged_op, xnn_delete_operator);
+  for (const char* queue_setting : {"1", "0"}) {
+    queue.Set(queue_setting);
+    size_t workspace_size = 0;
+    ASSERT_EQ(xnn_status_success, xnn_reshape_fully_connected_nc_pf32(
+                                      flagged_op, 128, &workspace_size,
+                                      pool.get()));
+    ASSERT_EQ(2, flagged_op->dynamic_context.gemm->gemm.f32_hybrid_sme_threads);
+    ASSERT_EQ(strcmp(queue_setting, "1") == 0
+                  ? xnn_parallelization_type_f32_hybrid_queue
+                  : xnn_parallelization_type_2d_tile_2d_dynamic_with_thread,
+              flagged_op->compute[flagged_op->num_compute_invocations - 1].type);
+  }
 }
 
 TEST(FULLY_CONNECTED_NC_PF32, neon_only_override) {
   ScopedF32EnvVar sme("XNN_F32_SME");
   ScopedF32EnvVar hybrid("XNN_ENABLE_F32_HYBRID");
+  ScopedF32EnvVar queue("XNNPACK_HYBRID_QUEUE");
   sme.Set("0");
   hybrid.Set("0");
   ASSERT_EQ(xnn_status_success, xnn_initialize(nullptr));
@@ -1333,30 +1393,35 @@ TEST(FULLY_CONNECTED_NC_PF32, neon_only_override) {
     std::unique_ptr<pthreadpool, decltype(&pthreadpool_destroy)> pool(
         pthreadpool_create(threads), pthreadpool_destroy);
     ASSERT_NE(nullptr, pool.get());
-    for (size_t m : {size_t{1}, m_max}) {
-      size_t workspace_size = 0;
-      ASSERT_EQ(xnn_status_success,
-                xnn_reshape_fully_connected_nc_pf32(op, m, &workspace_size,
-                                                    pool.get()));
-      ASSERT_EQ(1, op->num_compute_invocations);
-      ASSERT_EQ(xnn_parallelization_type_f32_hybrid_queue,
-                op->compute[0].type);
-      ASSERT_EQ(0, op->dynamic_context.gemm->gemm.f32_hybrid_sme_threads);
-      ASSERT_EQ(0, workspace_size);
-      ASSERT_EQ(xnn_status_success,
-                xnn_setup_fully_connected_nc_pf32(op, input.data(),
-                                                  output.data(), nullptr));
-      ASSERT_EQ(xnn_status_success, xnn_run_operator(op, pool.get()));
-      for (size_t row = 0; row < m; row++) {
-        for (size_t col = 0; col < n; col++) {
-          float expected = 0.0f;
-          for (size_t depth = 0; depth < k; depth++) {
-            expected += input[row * input_stride + depth] *
-                        weights[col * k + depth];
+    for (const char* queue_setting : {"1", "0"}) {
+      queue.Set(queue_setting);
+      for (size_t m : {size_t{1}, m_max}) {
+        size_t workspace_size = 0;
+        ASSERT_EQ(xnn_status_success,
+                  xnn_reshape_fully_connected_nc_pf32(op, m, &workspace_size,
+                                                      pool.get()));
+        ASSERT_EQ(1, op->num_compute_invocations);
+        ASSERT_EQ(strcmp(queue_setting, "1") == 0
+                      ? xnn_parallelization_type_f32_hybrid_queue
+                      : xnn_parallelization_type_2d_tile_2d_dynamic_with_thread,
+                  op->compute[0].type);
+        ASSERT_EQ(0, op->dynamic_context.gemm->gemm.f32_hybrid_sme_threads);
+        ASSERT_EQ(0, workspace_size);
+        ASSERT_EQ(xnn_status_success,
+                  xnn_setup_fully_connected_nc_pf32(op, input.data(),
+                                                    output.data(), nullptr));
+        ASSERT_EQ(xnn_status_success, xnn_run_operator(op, pool.get()));
+        for (size_t row = 0; row < m; row++) {
+          for (size_t col = 0; col < n; col++) {
+            float expected = 0.0f;
+            for (size_t depth = 0; depth < k; depth++) {
+              expected += input[row * input_stride + depth] *
+                          weights[col * k + depth];
+            }
+            ASSERT_NEAR(expected, output[row * output_stride + col],
+                        std::max(1.0e-4f * std::abs(expected), 1.0e-4f))
+                << "at " << row << ", " << col;
           }
-          ASSERT_NEAR(expected, output[row * output_stride + col],
-                      std::max(1.0e-4f * std::abs(expected), 1.0e-4f))
-              << "at " << row << ", " << col;
         }
       }
     }

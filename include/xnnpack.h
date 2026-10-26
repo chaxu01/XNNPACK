@@ -122,6 +122,9 @@ extern "C" {
 /// with any other codepath that could be used in the same compiled XNNPACK library.
 #define XNN_FLAG_SLOW_CONSISTENT_ARITHMETIC 0x00002000
 
+/// Enable experimental concurrent SME2 and NEON F32 fully connected execution.
+#define XNN_FLAG_HYBRID_SME2_F32 0x00008000
+
 /// The number of entries in an array of xnn_quantization_params that XNNPACK may read beyond array bounds.
 /// The caller must allocate at least this many extra xnn_quantization_params before passing the array to XNNPACK.
 ///

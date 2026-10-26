@@ -774,6 +774,114 @@ TEST(FullyConnectedF16F16F32, static_b) {
   TestStaticB<xnn_float16, xnn_float16, float>();
 }
 TEST(FullyConnectedF32, static_b) { TestStaticB<float, float, float>(); }
+
+#if XNN_ARCH_ARM64 && XNN_ENABLE_KLEIDIAI && XNN_ENABLE_ARM_SME2 && \
+    (XNN_COMPILER_CLANG || XNN_COMPILER_GCC) && !defined(XNNPACK_USE_YNNPACK)
+TEST(FullyConnectedF32, elastic_hybrid_runtime_flag_and_schedulers) {
+  ASSERT_EQ(xnn_status_success, xnn_initialize(nullptr));
+  const struct xnn_gemm_config* config = xnn_init_pf32_gemm_config();
+  if (config == nullptr || config->arch != xnn_arch_arm_sme2) {
+    GTEST_SKIP() << "SME2 F32 GEMM is not available";
+  }
+
+  class ScopedEnvVar {
+   public:
+    explicit ScopedEnvVar(const char* name) : name_(name) {
+      const char* value = getenv(name);
+      if (value != nullptr) {
+        was_set_ = true;
+        original_ = value;
+      }
+    }
+    ~ScopedEnvVar() {
+      if (was_set_) {
+        setenv(name_, original_.c_str(), 1);
+      } else {
+        unsetenv(name_);
+      }
+    }
+    void Set(const char* value) { setenv(name_, value, 1); }
+
+   private:
+    const char* name_;
+    bool was_set_ = false;
+    std::string original_;
+  };
+  ScopedEnvVar sme("XNN_F32_SME");
+  ScopedEnvVar hybrid("XNN_ENABLE_F32_HYBRID");
+  ScopedEnvVar queue("XNNPACK_HYBRID_QUEUE");
+  sme.Set("2");
+  hybrid.Set("0");
+  queue.Set("1");
+
+  constexpr size_t m = 129;
+  constexpr size_t n = 101;
+  constexpr size_t k = 131;
+  std::vector<float> input(m * k);
+  std::vector<float> weights(n * k);
+  std::vector<float> bias(n);
+  std::vector<float> reference(m * n);
+  std::vector<float> output(m * n);
+  for (size_t i = 0; i < input.size(); i++) {
+    input[i] = static_cast<float>((i * 37) % 101) / 101.0f - 0.5f;
+  }
+  for (size_t i = 0; i < weights.size(); i++) {
+    weights[i] = static_cast<float>((i * 17) % 103) / 103.0f - 0.5f;
+  }
+  for (size_t i = 0; i < bias.size(); i++) {
+    bias[i] = static_cast<float>(i % 13) / 13.0f - 0.5f;
+  }
+
+  std::unique_ptr<pthreadpool, decltype(&pthreadpool_destroy)> pool(
+      pthreadpool_create(6), pthreadpool_destroy);
+  ASSERT_NE(nullptr, pool.get());
+  auto run = [&](uint32_t runtime_flags, bool expect_flag, float* result) {
+    SubgraphTester subgraph(4);
+    subgraph.AddInputTensor({m, k}, input.data(), 0)
+        .AddStaticTensor({n, k}, 1, weights.data())
+        .AddStaticTensor({n}, 2, bias.data())
+        .AddOutputTensor({m, n}, result, 3)
+        .AddFullyConnected(-0.4f, 0.4f, 0, 1, 2, 3);
+    ASSERT_EQ(xnn_status_success,
+              subgraph.CreateRuntime(pool.get(), runtime_flags));
+    ASSERT_EQ(expect_flag,
+              (subgraph.Node(0)->flags & XNN_FLAG_HYBRID_SME2_F32) != 0);
+    subgraph.ReshapeRuntime().SetupRuntime();
+    for (size_t invocation = 0; invocation < 2; invocation++) {
+      std::fill(result, result + m * n,
+                std::numeric_limits<float>::quiet_NaN());
+      ASSERT_EQ(xnn_status_success, subgraph.InvokeRuntime());
+    }
+  };
+
+  run(/*runtime_flags=*/0, /*expect_flag=*/false, reference.data());
+  run(XNN_FLAG_HYBRID_SME2_F32, /*expect_flag=*/true, output.data());
+  for (size_t i = 0; i < output.size(); i++) {
+    ASSERT_NEAR(reference[i], output[i], 2.0e-4f) << "index " << i;
+  }
+
+  queue.Set("0");
+  run(XNN_FLAG_HYBRID_SME2_F32, /*expect_flag=*/true, output.data());
+  for (size_t i = 0; i < output.size(); i++) {
+    ASSERT_NEAR(reference[i], output[i], 2.0e-4f) << "index " << i;
+  }
+
+  queue.Set("1");
+  sme.Set("0");
+  run(XNN_FLAG_HYBRID_SME2_F32, /*expect_flag=*/true, output.data());
+  for (size_t i = 0; i < output.size(); i++) {
+    ASSERT_NEAR(reference[i], output[i], 2.0e-4f) << "index " << i;
+  }
+
+  sme.Set("2");
+  hybrid.Set("1");
+  run(/*runtime_flags=*/0, /*expect_flag=*/false, output.data());
+  for (size_t i = 0; i < output.size(); i++) {
+    ASSERT_NEAR(reference[i], output[i], 2.0e-4f) << "index " << i;
+  }
+}
+#endif
+
 TEST(FullyConnectedF32F16F16, static_b) {
   TestStaticB<float, xnn_float16, xnn_float16>();
 }

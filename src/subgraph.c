@@ -4282,6 +4282,13 @@ enum xnn_status xnn_subgraph_optimize_packed_lhs(xnn_subgraph_t subgraph,
                           xnn_node_type_to_string(node->type));
             node->packed_input_datatype = assumed_datatype;
             node->flags |= XNN_FLAG_INLINE_LHS_PACKING;
+            if (node->type == xnn_node_type_fully_connected &&
+                assumed_datatype == xnn_datatype_pfp32 &&
+                kernel_datatype == xnn_datatype_fp32 &&
+                (optimization_flags & XNN_FLAG_HYBRID_SME2_F32) != 0 &&
+                (optimization_flags & XNN_FLAG_SLOW_CONSISTENT_ARITHMETIC) == 0) {
+              node->flags |= XNN_FLAG_HYBRID_SME2_F32;
+            }
           }
         }
       } break;
